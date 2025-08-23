@@ -1,0 +1,356 @@
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+import math
+import random
+#Description: This program stimulates a smart cooling datacenter system which optmizes cooling methods and workload scheduling to reduce environmental challenges
+
+# Features: shows three cooling approaches - cooling towers, evaporative air cooling, and dry coolers
+
+
+# ------------ output: ------------
+#Hourly breakdown of cooling mode, energy use, and water consumptions
+# Totals for server engergy, energy, water consumption and carbon emissions
+
+ # Helpers: psychrometrics & clamping 
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def wet_bulb_stull(T_c: float, RH_pct: float) -> float:
+    """
+    Approximate wet-bulb temperature (°C) from Stull (2011) formula.
+    Valid for typical ambient ranges. RH in percent.
+    """
+    RH = clamp(RH_pct, 1.0, 100.0)
+    T = T_c
+    Tw = T * math.atan(0.151977 * (RH + 8.313659) ** 0.5) + \
+         math.atan(T + RH) - math.atan(RH - 1.676331) + \
+         0.00391838 * RH ** 1.5 * math.atan(0.023101 * RH) - 4.686035
+    return Tw
+
+# Data classes 
+
+@dataclass
+class EnvironmentHour:
+    temp_c: float              # Dry-bulb temperature (°C)
+    rh_pct: float              # Relative humidity (%)
+    ewif_L_per_kWh: float      # Grid water consumption intensity (L/kWh)
+    carbon_kg_per_kWh: float   # Grid carbon intensity (kg/kWh)
+
+@dataclass
+class WorkloadHour:
+    base_kWh: float            # Non-shiftable load (kWh)
+    flex_kWh_capacity: float   # Max shiftable load that can be placed in this hour (kWh)
+
+@dataclass
+class CoolingMode:
+    name: str
+    # Extra facility energy overhead relative to base PUE (e.g., dry coolers raise energy use)
+    delta_pue: float
+    # Onsite water consumption WUE model: returns liters/kWh at this hour
+    def_wue_fn: callable
+    # Whether mode uses evaporative process (affects blowdown modeling)
+    evaporative: bool
+
+@dataclass
+class CoolingParams:
+    base_pue: float
+    modes: Dict[str, CoolingMode]
+
+@dataclass
+class WaterSystemParams:
+    cycles_of_concentration: float  # CoC (e.g., 3–7 typical)
+    drift_frac_of_evap: float       # Fraction of evaporation lost as drift (simple proxy)
+    recycle_blowdown_frac: float    # Fraction of blowdown recycled as makeup water
+
+@dataclass
+class Weights:
+    w_onsite_water: float  # weight for onsite water consumption (L)
+    w_offsite_water: float # weight for offsite water consumption (L)
+    w_carbon: float        # weight for carbon (kg)
+
+# Cooling WUE models (illustrative) 
+
+def tower_wue_L_per_kWh(temp_c: float, rh_pct: float) -> float:
+    """
+    Evaporative cooling tower onsite water consumption (L/kWh).
+    Increases with wet-bulb temp; bounded for realism.
+    """
+    tw = wet_bulb_stull(temp_c, rh_pct)
+    # Base ~0.8 L/kWh at cool/wet, ~3.0 L/kWh at hot/humid (illustrative)
+    wue = 0.8 + 0.12 * max(0.0, tw - 15.0)
+    return clamp(wue, 0.5, 3.5)
+
+def evap_air_wue_L_per_kWh(temp_c: float, rh_pct: float) -> float:
+    """
+    Air-side economization with evaporative assist.
+    Lower average water than towers, but spikes in hot/dry.
+    """
+    hot = max(0.0, temp_c - 29.0)  # above ~29°C needs more assist
+    dry = max(0.0, 40.0 - rh_pct) / 40.0  # drier -> more evaporation
+    wue = 0.3 + 0.06 * hot + 0.4 * dry
+    return clamp(wue, 0.1, 2.5)
+
+def dry_cooler_wue_L_per_kWh(temp_c: float, rh_pct: float) -> float:
+    """
+    Dry coolers consume zero onsite water.
+    """
+    return 0.0
+
+#  Objective and simulation core 
+
+def hour_objective_per_kWh(env: EnvironmentHour,
+                           mode: CoolingMode,
+                           cooling: CoolingParams,
+                           weights: Weights) -> float:
+    """
+    Weighted objective per kWh of server energy, including:
+    - Onsite water (L/kWh)
+    - Offsite water via grid (L/kWh)
+    - Carbon via grid (kg/kWh)
+    Facility energy = PUE * server energy
+    """
+    onsite_wue = mode.def_wue_fn(env.temp_c, env.rh_pct)  # L/kWh (server)
+    pue = cooling.base_pue + mode.delta_pue
+    offsite_wue = env.ewif_L_per_kWh * pue
+    carbon = env.carbon_kg_per_kWh * pue
+    return (weights.w_onsite_water * onsite_wue +
+            weights.w_offsite_water * offsite_wue +
+            weights.w_carbon * carbon)
+
+def choose_best_mode(env: EnvironmentHour,
+                     cooling: CoolingParams,
+                     weights: Weights) -> CoolingMode:
+    best = None
+    best_cost = float('inf')
+    for m in cooling.modes.values():
+        cost = hour_objective_per_kWh(env, m, cooling, weights)
+        if cost < best_cost:
+            best_cost = cost
+            best = m
+    return best
+
+def compute_onsite_water_breakdown(onsite_L: float,
+                                   mode: CoolingMode,
+                                   ws: WaterSystemParams) -> Tuple[float, float, float]:
+    """
+    Returns (consumption_L, blowdown_L, withdrawal_L) for onsite system.
+    - For evaporative modes: consumption = evaporation
+      Blowdown ≈ evaporation / (CoC - 1); some recycled
+      Withdrawal = evaporation + drift + blowdown - recycled_blowdown
+    - For dry modes: all zeros
+    """
+    if onsite_L <= 0 or not mode.evaporative:
+        return 0.0, 0.0, 0.0
+
+    evaporation = onsite_L  # onsite consumption is evaporation
+    blowdown = evaporation / max(1e-6, (ws.cycles_of_concentration - 1.0))
+    drift = ws.drift_frac_of_evap * evaporation
+    recycled = ws.recycle_blowdown_frac * blowdown
+
+    withdrawal = evaporation + drift + (blowdown - recycled)
+    return evaporation, blowdown, withdrawal
+
+#  Scheduling algorithm 
+
+def schedule_flexible_load(envs: List[EnvironmentHour],
+                           base_loads: List[WorkloadHour],
+                           cooling: CoolingParams,
+                           weights: Weights,
+                           total_flex_kWh: float,
+                           deadline_hour: int) -> List[float]:
+    """
+    Allocate total_flex_kWh across hours [0..deadline_hour] to minimize
+    the weighted objective per kWh, considering per-hour flex capacity.
+    Greedy by "cheapest hour" score (min over modes).
+    Returns flex_kWh per hour.
+    """
+    horizon = min(deadline_hour + 1, len(envs))
+    scores = []
+    for h in range(horizon):
+        # Evaluate best mode per hour to approximate marginal impact
+        best_mode = choose_best_mode(envs[h], cooling, weights)
+        score = hour_objective_per_kWh(envs[h], best_mode, cooling, weights)
+        scores.append((score, h))
+
+    scores.sort(key=lambda x: x[0])
+    allocation = [0.0] * len(envs)
+    remaining = total_flex_kWh
+
+    for _, h in scores:
+        if remaining <= 0:
+            break
+        cap = base_loads[h].flex_kWh_capacity
+        give = min(cap, remaining)
+        allocation[h] += give
+        remaining -= give
+
+    return allocation
+
+# Simulation driver 
+
+def simulate(envs: List[EnvironmentHour],
+             loads: List[WorkloadHour],
+             cooling: CoolingParams,
+             ws: WaterSystemParams,
+             weights: Weights,
+             total_flex_kWh: float,
+             deadline_hour: int) -> Dict:
+    """
+    Runs scheduling + per-hour cooling decisions and tallies metrics.
+    """
+    flex_alloc = schedule_flexible_load(envs, loads, cooling, weights, total_flex_kWh, deadline_hour)
+
+    per_hour = []
+    totals = {
+        "server_kWh": 0.0,
+        "facility_kWh": 0.0,
+        "onsite_consumption_L": 0.0,
+        "onsite_blowdown_L": 0.0,
+        "onsite_withdrawal_L": 0.0,
+        "offsite_water_L": 0.0,
+        "carbon_kg": 0.0,
+    }
+
+    for h, env in enumerate(envs):
+        demand_kWh = loads[h].base_kWh + flex_alloc[h]
+        if demand_kWh <= 0:
+            per_hour.append({"hour": h, "mode": None, "server_kWh": 0.0})
+            continue
+
+        mode = choose_best_mode(env, cooling, weights)
+        pue = cooling.base_pue + mode.delta_pue
+
+        server_kWh = demand_kWh
+        facility_kWh = pue * server_kWh
+
+        # Onsite water (consumption)
+        onsite_wue = mode.def_wue_fn(env.temp_c, env.rh_pct)  # L/kWh (server)
+        onsite_L = onsite_wue * server_kWh
+        cons_L, blowdown_L, withdrawal_L = compute_onsite_water_breakdown(onsite_L, mode, ws)
+
+        # Offsite water (consumption)
+        offsite_L = env.ewif_L_per_kWh * facility_kWh
+
+        # Carbon
+        carbon_kg = env.carbon_kg_per_kWh * facility_kWh
+
+        per_hour.append({
+            "hour": h,
+            "mode": mode.name,
+            "server_kWh": server_kWh,
+            "facility_kWh": facility_kWh,
+            "onsite_consumption_L": cons_L,
+            "onsite_blowdown_L": blowdown_L,
+            "onsite_withdrawal_L": withdrawal_L,
+            "offsite_water_L": offsite_L,
+            "carbon_kg": carbon_kg,
+            "temp_c": env.temp_c,
+            "rh_pct": env.rh_pct,
+            "ewif_L_per_kWh": env.ewif_L_per_kWh,
+            "carbon_kg_per_kWh": env.carbon_kg_per_kWh,
+            "flex_kWh_alloc": flex_alloc[h]
+        })
+
+        totals["server_kWh"] += server_kWh
+        totals["facility_kWh"] += facility_kWh
+        totals["onsite_consumption_L"] += cons_L
+        totals["onsite_blowdown_L"] += blowdown_L
+        totals["onsite_withdrawal_L"] += withdrawal_L
+        totals["offsite_water_L"] += offsite_L
+        totals["carbon_kg"] += carbon_kg
+
+    return {"per_hour": per_hour, "totals": totals, "flex_alloc": flex_alloc}
+
+#  Example configuration & run 
+
+def build_default_cooling() -> CoolingParams:
+    modes = {
+        "tower": CoolingMode(
+            name="tower",
+            delta_pue=0.0,
+            def_wue_fn=tower_wue_L_per_kWh,
+            evaporative=True
+        ),
+        "evap_air": CoolingMode(
+            name="evap_air",
+            delta_pue=0.02,  # slight extra fan/pump overhead
+            def_wue_fn=evap_air_wue_L_per_kWh,
+            evaporative=True
+        ),
+        "dry": CoolingMode(
+            name="dry",
+            delta_pue=0.08,  # higher energy penalty
+            def_wue_fn=dry_cooler_wue_L_per_kWh,
+            evaporative=False
+        )
+    }
+    return CoolingParams(base_pue=1.15, modes=modes)
+
+def demo_environment(hours: int = 24) -> List[EnvironmentHour]:
+    """
+    Synthetic day: warm afternoon, cooler nights; varying grid EWIF/carbon.
+    """
+    envs = []
+    for h in range(hours):
+        temp = 18 + 10 * math.sin((h - 6) * math.pi / 12)  # ~8°C at night to ~28°C mid-afternoon
+        temp = clamp(temp, 8, 32)
+        rh = clamp(65 - 25 * math.sin((h - 6) * math.pi / 12), 25, 85)
+        # Simulate grid water intensity (L/kWh) and carbon (kg/kWh)
+        ewif = clamp(2.2 + 0.8 * math.sin(h * math.pi / 12), 1.5, 3.2)     # 1.5–3.2 L/kWh
+        carbon = clamp(0.18 + 0.06 * math.cos(h * math.pi / 12), 0.10, 0.30)  # 0.10–0.30 kg/kWh
+        envs.append(EnvironmentHour(temp_c=temp, rh_pct=rh, ewif_L_per_kWh=ewif, carbon_kg_per_kWh=carbon))
+    return envs
+
+def demo_workload(hours: int = 24) -> List[WorkloadHour]:
+    loads = []
+    for h in range(hours):
+        base = 400.0  # base non-shiftable kWh
+        # Capacity for flexible training: more at night
+        flex_cap = 0.0
+        if h in list(range(0, 7)) + list(range(21, 24)):
+            flex_cap = 600.0
+        loads.append(WorkloadHour(base_kWh=base, flex_kWh_capacity=flex_cap))
+    return loads
+
+def print_summary(results: Dict):
+    t = results["totals"]
+    print("\n=== Totals ===")
+    print(f"Server energy (kWh):        {t['server_kWh']:.0f}")
+    print(f"Facility energy (kWh):      {t['facility_kWh']:.0f}")
+    print(f"Onsite consumption (L):     {t['onsite_consumption_L']:.0f}")
+    print(f"Onsite blowdown (L):        {t['onsite_blowdown_L']:.0f}")
+    print(f"Onsite withdrawal (L):      {t['onsite_withdrawal_L']:.0f}")
+    print(f"Offsite water (L):          {t['offsite_water_L']:.0f}")
+    print(f"Carbon (kg):                {t['carbon_kg']:.0f}")
+
+    print("\n=== Sample hours ===")
+    for row in results["per_hour"][10:15]:
+        print(f"h={row['hour']:02d}  mode={row['mode']:8s}  T={row['temp_c']:.1f}°C RH={row['rh_pct']:.0f}%  "
+              f"server={row['server_kWh']:.0f}kWh  onsite={row['onsite_consumption_L']:.0f}L  "
+              f"offsite={row['offsite_water_L']:.0f}L  carbon={row['carbon_kg']:.1f}kg  flex={row['flex_kWh_alloc']:.0f}kWh")
+
+if __name__ == "__main__":
+    HOURS = 24
+    envs = demo_environment(HOURS)
+    loads = demo_workload(HOURS)
+
+    cooling = build_default_cooling()
+    water_sys = WaterSystemParams(
+        cycles_of_concentration=5.0,  # higher CoC -> less blowdown, lower withdrawal
+        drift_frac_of_evap=0.002,     # ~0.2% of evaporation lost as drift (illustrative)
+        recycle_blowdown_frac=0.5     # 50% of blowdown recycled as makeup
+    )
+
+    # Weights: emphasize water reductions, include carbon
+    weights = Weights(
+        w_onsite_water=1.0,
+        w_offsite_water=1.0,
+        w_carbon=0.3
+    )
+
+    total_flex_kWh = 4000.0  # total training energy to schedule within deadline
+    deadline_hour = 23       # must schedule within the day
+
+    results = simulate(envs, loads, cooling, water_sys, weights, total_flex_kWh, deadline_hour)
+    print_summary(results)
